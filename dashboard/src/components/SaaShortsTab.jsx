@@ -110,6 +110,16 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // A self-host backend pointed at a local Voicebox does its own narration, so
+  // the ElevenLabs key stops being required. Server-side setting, hence /api/config.
+  const [voiceboxEnabled, setVoiceboxEnabled] = useState(false);
+  useEffect(() => {
+    fetch(getApiUrl('/api/config'))
+      .then(res => res.ok ? res.json() : {})
+      .then(cfg => setVoiceboxEnabled(!!cfg.voiceboxEnabled))
+      .catch(() => {});
+  }, []);
+
   // Fetch actor gallery on mount
   useEffect(() => {
     setLoadingGallery(true);
@@ -268,8 +278,8 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
       alert('fal.ai API key required. Set it in Settings.');
       return;
     }
-    if (!elevenLabsKey) {
-      alert('ElevenLabs API key required. Set it in Settings.');
+    if (!elevenLabsKey && !voiceboxEnabled) {
+      alert('ElevenLabs API key required. Set it in Settings, or point the backend at a local Voicebox with VOICEBOX_URL.');
       return;
     }
 

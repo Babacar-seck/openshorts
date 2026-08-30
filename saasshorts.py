@@ -19,6 +19,7 @@ import time
 import subprocess
 
 from ffmpeg_utils import video_encode_args, DELIVERY, mark_ai_generated
+import voicebox_tts
 import httpx
 from urllib.parse import urljoin
 from typing import Optional, List, Dict, Callable
@@ -1373,8 +1374,16 @@ def generate_full_video(
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             future_img = executor.submit(generate_actor_image, actor_desc, fal_key, actor_img) if need_img else None
+            # Local Voicebox when VOICEBOX_URL is set, ElevenLabs otherwise. The
+            # adapter mirrors generate_voiceover's signature so this stays one
+            # expression (see voicebox_tts.py for why the swap lives there).
+            voiceover_fn = (
+                voicebox_tts.generate_voiceover
+                if voicebox_tts.is_configured()
+                else generate_voiceover
+            )
             future_voice = executor.submit(
-                generate_voiceover, full_narration, elevenlabs_key, audio_path, voice_id
+                voiceover_fn, full_narration, elevenlabs_key, audio_path, voice_id
             ) if need_voice else None
 
             if future_img:

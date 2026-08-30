@@ -30,6 +30,7 @@ from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 import recut
 import layout_ranges
+import voicebox_tts
 
 load_dotenv()
 
@@ -1878,6 +1879,9 @@ async def get_config():
     return {
         "youtubeUrlEnabled": not DISABLE_YOUTUBE_URL,
         "billingEnabled": BILLING_ENABLED,
+        # Self-host can point the AI Shorts voiceover at a local Voicebox, in
+        # which case the dashboard must stop demanding an ElevenLabs key.
+        "voiceboxEnabled": voicebox_tts.is_configured(),
         "googleAuthEnabled": bool(BILLING_ENABLED and cloud.settings.google_auth_enabled),
         "jobRetentionSeconds": JOB_RETENTION_SECONDS,
     }
