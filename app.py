@@ -30,6 +30,7 @@ from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 import recut
 import layout_ranges
+import voicebox_tts
 
 load_dotenv()
 
@@ -1878,6 +1879,9 @@ async def get_config():
     return {
         "youtubeUrlEnabled": not DISABLE_YOUTUBE_URL,
         "billingEnabled": BILLING_ENABLED,
+        # Self-host can point the AI Shorts voiceover at a local Voicebox, in
+        # which case the dashboard must stop demanding an ElevenLabs key.
+        "voiceboxEnabled": voicebox_tts.is_configured(),
         "googleAuthEnabled": bool(BILLING_ENABLED and cloud.settings.google_auth_enabled),
         "jobRetentionSeconds": JOB_RETENTION_SECONDS,
     }
@@ -5365,6 +5369,7 @@ from saasshorts import (
     generate_actor_images,
     get_elevenlabs_voices,
     DEFAULT_VOICES,
+    SCRIPT_LANGUAGES,
 )
 
 # State for SaaSShorts jobs (separate from video processing jobs)
@@ -5392,6 +5397,17 @@ async def saasshorts_analyze(
 
     if not req.url and not req.description:
         raise HTTPException(status_code=400, detail="Provide a URL or a product description")
+
+    # Reject an unknown language here rather than letting generate_scripts pick
+    # a default: the old binary turned every unrecognised code into English, so
+    # a caller asking for a language we do not support got three English scripts
+    # and no way to tell.
+    if req.language not in SCRIPT_LANGUAGES:
+        known = ", ".join(sorted(SCRIPT_LANGUAGES))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported language '{req.language}'. Supported: {known}",
+        )
 
     # Meter the managed Gemini research/analysis (no-op for self-host).
     saas_minutes = _cloud_config.MANAGED_ANALYSIS_MINUTES if BILLING_ENABLED else 0
@@ -5797,6 +5813,10 @@ async def saasshorts_actor_gallery():
 
 class SaaSGenerateRequest(BaseModel):
     script: dict
+    # The language the script was written in. /analyze picks it, but the script
+    # dict does not carry it, so it has to travel with the generate request or
+    # the voiceover has no way to know what it is narrating.
+    language: str = "en"
     voice_id: Optional[str] = None
     actor_description: Optional[str] = None
     selected_actor_url: Optional[str] = None  # Pre-selected actor image URL
@@ -5821,8 +5841,20 @@ async def saasshorts_generate(
 
     if not fal_key:
         raise HTTPException(status_code=400, detail="Missing fal.ai API Key (X-Fal-Key header)")
-    if not elevenlabs_key:
+    # A self-host backend pointed at a local Voicebox narrates without
+    # ElevenLabs, so requiring the header here would reject the very jobs the
+    # dashboard now lets through.
+    if not elevenlabs_key and not voicebox_tts.is_configured():
         raise HTTPException(status_code=400, detail="Missing ElevenLabs API Key (X-ElevenLabs-Key header)")
+
+    # Same guard as /analyze: an unknown code must not reach the voiceover,
+    # where it would silently fall back to whatever VOICEBOX_LANGUAGE says.
+    if req.language not in SCRIPT_LANGUAGES:
+        known = ", ".join(sorted(SCRIPT_LANGUAGES))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported language '{req.language}'. Supported: {known}",
+        )
 
     # Support retry: reuse output_dir so cached assets (image, voice, head, broll) are kept
     reused = False
@@ -5898,6 +5930,7 @@ async def saasshorts_generate(
         "actor_description": req.actor_description,
         "selected_actor_path": selected_actor_path,
         "video_mode": req.video_mode,
+        "language": req.language,
     }
 
     async def run_generation():

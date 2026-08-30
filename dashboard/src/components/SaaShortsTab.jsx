@@ -110,6 +110,16 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // A self-host backend pointed at a local Voicebox does its own narration, so
+  // the ElevenLabs key stops being required. Server-side setting, hence /api/config.
+  const [voiceboxEnabled, setVoiceboxEnabled] = useState(false);
+  useEffect(() => {
+    fetch(getApiUrl('/api/config'))
+      .then(res => res.ok ? res.json() : {})
+      .then(cfg => setVoiceboxEnabled(!!cfg.voiceboxEnabled))
+      .catch(() => {});
+  }, []);
+
   // Fetch actor gallery on mount
   useEffect(() => {
     setLoadingGallery(true);
@@ -135,13 +145,19 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
       'en-male': '29vD33N1CtxCmqQRPOHJ',    // Drew
       'es-female': 'EXAVITQu4vr4xnSDxMaL',  // Bella
       'es-male': 'ErXwobaYiN019PkySvjV',     // Antoni
+      'fr-female': 'EXAVITQu4vr4xnSDxMaL',  // Bella
+      'fr-male': 'ErXwobaYiN019PkySvjV',     // Antoni
     };
     // If we have fetched voices, pick the first matching one; otherwise use hardcoded default
     const matchingVoice = voices.find(v => (v.labels?.gender || '').toLowerCase() === actorGender);
     if (matchingVoice) {
       setSelectedVoice(matchingVoice.voice_id);
     } else {
-      setSelectedVoice(genderDefaults[`${language}-${actorGender}`] || genderDefaults['en-female']);
+      // Fall back within the chosen gender, never to 'en-female': a male actor
+      // in an unlisted language used to end up with an English female voice.
+      setSelectedVoice(
+        genderDefaults[`${language}-${actorGender}`] || genderDefaults[`en-${actorGender}`]
+      );
     }
     // Re-pick only when the gender/language choice changes, not on every voices refresh.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -268,8 +284,8 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
       alert('fal.ai API key required. Set it in Settings.');
       return;
     }
-    if (!elevenLabsKey) {
-      alert('ElevenLabs API key required. Set it in Settings.');
+    if (!elevenLabsKey && !voiceboxEnabled) {
+      alert('ElevenLabs API key required. Set it in Settings, or point the backend at a local Voicebox with VOICEBOX_URL.');
       return;
     }
 
@@ -297,6 +313,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
         },
         body: JSON.stringify({
           script: scriptToSend,
+          language,
           voice_id: selectedVoice,
           actor_description: actorDescription || undefined,
           selected_actor_url: selectedActor || undefined,
@@ -344,6 +361,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
         },
         body: JSON.stringify({
           script: scriptToSend,
+          language,
           voice_id: selectedVoice,
           actor_description: actorDescription || undefined,
           retry_job_id: jobId,
@@ -493,6 +511,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                     options={[
                       { value: 'en', label: 'English', icon: '🇺🇸' },
                       { value: 'es', label: 'Español', icon: '🇪🇸' },
+                      { value: 'fr', label: 'Français', icon: '🇫🇷' },
                     ]}
                     value={language}
                     onChange={setLanguage}
@@ -807,7 +826,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
               {/* Voice Selection */}
               <div>
                 <label className="eyebrow block mb-2">
-                  Voice {language === 'es' ? '(Spanish)' : '(English)'}
+                  Voice ({{ en: 'English', es: 'Spanish', fr: 'French' }[language] || 'English'})
                 </label>
                 {(() => {
                   // Filter voices by language/accent
@@ -818,18 +837,20 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                         return gender === actorGender;
                       })
                       .sort((a, b) => {
-                        const aAccent = (a.labels?.accent || '').toLowerCase();
-                        const bAccent = (b.labels?.accent || '').toLowerCase();
-                        if (language === 'es') {
-                          // Spanish/latin accents first, then everything else
-                          const aScore = (aAccent.includes('spanish') || aAccent.includes('latin')) ? 0 : 1;
-                          const bScore = (bAccent.includes('spanish') || bAccent.includes('latin')) ? 0 : 1;
-                          return aScore - bScore;
-                        }
-                        // English: american/british first
-                        const aScore = (aAccent.includes('american') || aAccent.includes('british')) ? 0 : 1;
-                        const bScore = (bAccent.includes('american') || bAccent.includes('british')) ? 0 : 1;
-                        return aScore - bScore;
+                        // Accents that suit the chosen language sort first. A
+                        // table rather than a branch per language: everything
+                        // unlisted still shows, the multilingual model speaks
+                        // the language whatever the voice's native accent.
+                        const preferred = {
+                          en: ['american', 'british'],
+                          es: ['spanish', 'latin'],
+                          fr: ['french'],
+                        }[language] || [];
+                        const score = (v) => {
+                          const accent = (v.labels?.accent || '').toLowerCase();
+                          return preferred.some((p) => accent.includes(p)) ? 0 : 1;
+                        };
+                        return score(a) - score(b);
                       })
                     : [];
 
@@ -887,9 +908,19 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                       { id: 'ErXwobaYiN019PkySvjV', name: 'Antoni (cálido)' },
                       { id: '29vD33N1CtxCmqQRPOHJ', name: 'Drew (confiado)' },
                     ],
+                    'fr-female': [
+                      { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Bella (douce)' },
+                      { id: '21m00Tcm4TlvDq8ikWAM', name: 'Rachel (posée)' },
+                    ],
+                    'fr-male': [
+                      { id: 'ErXwobaYiN019PkySvjV', name: 'Antoni (chaleureux)' },
+                      { id: '29vD33N1CtxCmqQRPOHJ', name: 'Drew (assuré)' },
+                    ],
                   };
                   const key = `${language}-${actorGender}`;
-                  const opts = defaults[key] || defaults['en-female'];
+                  // Fall back within the chosen gender: `defaults['en-female']`
+                  // handed a male actor an English female voice.
+                  const opts = defaults[key] || defaults[`en-${actorGender}`];
                   return (
                     <select value={selectedVoice} onChange={(e) => setSelectedVoice(e.target.value)} className="input-field">
                       {opts.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}

@@ -16,9 +16,11 @@ import os
 import re
 import json
 import time
+import functools
 import subprocess
 
 from ffmpeg_utils import video_encode_args, DELIVERY, mark_ai_generated
+import voicebox_tts
 import httpx
 from urllib.parse import urljoin
 from typing import Optional, List, Dict, Callable
@@ -387,6 +389,59 @@ Include 5-8 pain points, 4-6 emotional hooks, and 4+ viral angles."""
     return analysis
 
 
+# Script languages. A table rather than an if/else because the previous binary
+# (`"Spanish" if language == "es" else "English"`) had no notion of an unknown
+# code: every language that was not Spanish silently produced English, so asking
+# for French returned three English scripts and no error.
+#
+# The instruction block is not a translation of the English one. Its job is the
+# hook examples: they carry the register a native actually speaks on TikTok, and
+# that register is most of what makes a UGC script land. Adding a language means
+# writing them, not running the English ones through a translator.
+SCRIPT_LANGUAGES = {
+    "en": {
+        "name": "English",
+        "cta": 'Say it as "link in bio". Examples: "Link in bio, go try it", "Check the link in my bio".',
+        "instructions": """
+LANGUAGE: ALL narrations, subtitles, captions, and hashtags MUST be in ENGLISH.
+Use natural casual American English like a real person on TikTok. Contractions, slang OK.
+Examples of English UGC hooks: "Okay so I just found this tool and...", "Stop doing this manually, there's a better way", "I can't believe nobody told me about this sooner..."
+""",
+    },
+    "es": {
+        "name": "Spanish",
+        "cta": 'Say it as "enlace en la bio". Example: "El enlace está en la bio, probadlo".',
+        "instructions": """
+LANGUAGE: ALL narrations, subtitles, captions, and hashtags MUST be in SPANISH (Spain/Latin America).
+Use natural casual Spanish like a real person would speak on TikTok. Contractions, slang OK.
+Examples of Spanish UGC hooks: "Tío, no me puedo creer que nadie me haya dicho esto antes...", "Si usas Excel para esto, necesitas ver esto YA", "Os voy a enseñar algo que me ha cambiado la vida..."
+""",
+    },
+    "fr": {
+        "name": "French",
+        "cta": 'Say it as "lien dans la bio". Examples: "Le lien est dans la bio, va tester", "Lien dans ma bio".',
+        "instructions": """
+LANGUAGE: ALL narrations, subtitles, captions, and hashtags MUST be in FRENCH (France).
+Use natural casual spoken French like a real person on TikTok: always tutoiement, dropped "ne" in negations ("j'y crois pas", not "je n'y crois pas"), contractions and filler words. Never the formal written register.
+Examples of French UGC hooks: "Franchement j'y crois pas que personne m'ait dit ça avant...", "Si tu fais encore ça à la main, faut vraiment que tu voies ça", "Je vais te montrer un truc qui m'a changé la vie..."
+""",
+    },
+}
+
+
+def language_spec(language: str) -> dict:
+    """The prompt spec for a language code.
+
+    Raises on an unknown code rather than defaulting: falling back to English is
+    exactly what let a French request go out as English scripts with no warning.
+    """
+    try:
+        return SCRIPT_LANGUAGES[language]
+    except KeyError:
+        known = ", ".join(sorted(SCRIPT_LANGUAGES))
+        raise ValueError(f"Unsupported script language '{language}'. Known: {known}")
+
+
 def generate_scripts(
     analysis: dict,
     gemini_key: str,
@@ -399,8 +454,8 @@ def generate_scripts(
     from google import genai
     from google.genai import types
 
-    lang_name = "Spanish" if language == "es" else "English"
-    print(f"[SaaSShorts] 📝 Generating {num_scripts} scripts ({style}, {lang_name})...")
+    lang = language_spec(language)
+    print(f"[SaaSShorts] 📝 Generating {num_scripts} scripts ({style}, {lang['name']})...")
 
     client = genai.Client(api_key=gemini_key)
 
@@ -412,19 +467,7 @@ def generate_scripts(
         "comparison": "Before/after comparison.",
     }
 
-    lang_instructions = ""
-    if language == "es":
-        lang_instructions = """
-LANGUAGE: ALL narrations, subtitles, captions, and hashtags MUST be in SPANISH (Spain/Latin America).
-Use natural casual Spanish like a real person would speak on TikTok. Contractions, slang OK.
-Examples of Spanish UGC hooks: "Tío, no me puedo creer que nadie me haya dicho esto antes...", "Si usas Excel para esto, necesitas ver esto YA", "Os voy a enseñar algo que me ha cambiado la vida..."
-"""
-    else:
-        lang_instructions = """
-LANGUAGE: ALL narrations, subtitles, captions, and hashtags MUST be in ENGLISH.
-Use natural casual American English like a real person on TikTok. Contractions, slang OK.
-Examples of English UGC hooks: "Okay so I just found this tool and...", "Stop doing this manually, there's a better way", "I can't believe nobody told me about this sooner..."
-"""
+    lang_instructions = lang["instructions"]
 
     prompt = f"""You are a viral short-form video scriptwriter for TikTok/Instagram Reels.
 Generate {num_scripts} video scripts to promote this product/business.
@@ -527,8 +570,8 @@ RULES:
 - B-roll prompts: cinematic, specific, detailed visual descriptions
 - Each script should use a different pain point / angle
 - Vary actor demographics across scripts
-- CTA MUST always mention "link in bio" / "enlace en la bio". Examples: "Link in bio, go try it", "Check the link in my bio", "El enlace está en la bio, probadlo"
-- Write ALL text in {lang_name}
+- CTA MUST always point at the link in the bio. {lang['cta']}
+- Write ALL text in {lang['name']}
 - Actor gender: {actor_gender}. ALL actor_description fields MUST describe a {actor_gender} person. Use diverse ages/ethnicities across scripts.
 - IMPORTANT: actor_description MUST ALWAYS be in ENGLISH regardless of script language. Only describe physical appearance: age, gender, ethnicity, hair, clothing. NO actions, NO background, NO scene description.
 - Actors must look European, attractive but natural, slightly nerdy/tech vibe. Vary across: blonde, brunette, redhead. Ages 22-35.
@@ -1373,8 +1416,23 @@ def generate_full_video(
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             future_img = executor.submit(generate_actor_image, actor_desc, fal_key, actor_img) if need_img else None
+            # Local Voicebox when VOICEBOX_URL is set, ElevenLabs otherwise. The
+            # adapter mirrors generate_voiceover's signature so this stays one
+            # expression (see voicebox_tts.py for why the swap lives there).
+            #
+            # The script's language is bound with partial rather than added to
+            # the submit call: ElevenLabs picks the language from the text via
+            # its multilingual model and has no such parameter, so passing one
+            # to both would mean editing upstream's function signature.
+            voiceover_fn = (
+                functools.partial(
+                    voicebox_tts.generate_voiceover, language=config.get("language")
+                )
+                if voicebox_tts.is_configured()
+                else generate_voiceover
+            )
             future_voice = executor.submit(
-                generate_voiceover, full_narration, elevenlabs_key, audio_path, voice_id
+                voiceover_fn, full_narration, elevenlabs_key, audio_path, voice_id
             ) if need_voice else None
 
             if future_img:
