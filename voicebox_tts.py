@@ -109,15 +109,28 @@ def generate_voiceover(
     elevenlabs_key: Optional[str] = None,
     output_path: str = "voiceover.wav",
     voice_id: Optional[str] = None,
+    language: Optional[str] = None,
 ) -> str:
     """Generate voiceover audio with Voicebox, writing a WAV to output_path.
 
-    The signature mirrors ``saasshorts.generate_voiceover`` on purpose so the
-    swap at the call site is a single expression. ``elevenlabs_key`` is ignored
-    (nothing here talks to ElevenLabs) and ``voice_id`` is accepted as an
-    override of ``VOICEBOX_PROFILE`` — an ElevenLabs voice id will never match a
-    Voicebox profile, so a caller that passes its default through unchanged gets
-    the configured profile instead of a confusing failure.
+    The four leading parameters mirror ``saasshorts.generate_voiceover`` on
+    purpose so the swap at the call site stays a single expression.
+    ``elevenlabs_key`` is ignored (nothing here talks to ElevenLabs) and
+    ``voice_id`` is accepted as an override of ``VOICEBOX_PROFILE`` — an
+    ElevenLabs voice id will never match a Voicebox profile, so a caller that
+    passes its default through unchanged gets the configured profile instead of
+    a confusing failure.
+
+    ``language`` is the job's script language and the call site binds it with
+    functools.partial, which keeps the positional signature identical to the
+    ElevenLabs one. It wins over ``VOICEBOX_LANGUAGE``, which is now only the
+    default for callers that have no script: an env var cannot know what
+    language this particular script was written in, and the mismatch narrates
+    English text with French phonetics without ever failing.
+
+    The code is passed to Voicebox as-is rather than checked against a copy of
+    its accepted list — Voicebox validates it and answers a clear 422, and a
+    second list here would be one more thing to drift.
     """
     url = base_url()
     if not url:
@@ -136,7 +149,7 @@ def generate_voiceover(
     body = {
         "profile_id": profile_id,
         "text": text,
-        "language": (os.getenv("VOICEBOX_LANGUAGE") or DEFAULT_LANGUAGE).strip(),
+        "language": (language or os.getenv("VOICEBOX_LANGUAGE") or DEFAULT_LANGUAGE).strip(),
         "normalize": True,
     }
     engine = (os.getenv("VOICEBOX_ENGINE") or "").strip()
@@ -148,7 +161,13 @@ def generate_voiceover(
     except ValueError:
         timeout = DEFAULT_TIMEOUT
 
-    print(f"[Voicebox] 🎙️ Generating voiceover ({len(text)} chars) on {url}...")
+    # The language is in the log on purpose: a wrong one does not fail, it
+    # narrates the text with another language's phonetics, and that is only
+    # noticeable by listening unless it is written down.
+    print(
+        f"[Voicebox] 🎙️ Generating voiceover ({len(text)} chars, "
+        f"lang={body['language']}) on {url}..."
+    )
 
     # Voicebox always answers WAV, while the caller names the file .mp3
     # (saasshorts.py builds "<slug>_voice.mp3"). Writing WAV bytes under that

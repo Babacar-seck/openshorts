@@ -16,6 +16,7 @@ import os
 import re
 import json
 import time
+import functools
 import subprocess
 
 from ffmpeg_utils import video_encode_args, DELIVERY, mark_ai_generated
@@ -1418,8 +1419,15 @@ def generate_full_video(
             # Local Voicebox when VOICEBOX_URL is set, ElevenLabs otherwise. The
             # adapter mirrors generate_voiceover's signature so this stays one
             # expression (see voicebox_tts.py for why the swap lives there).
+            #
+            # The script's language is bound with partial rather than added to
+            # the submit call: ElevenLabs picks the language from the text via
+            # its multilingual model and has no such parameter, so passing one
+            # to both would mean editing upstream's function signature.
             voiceover_fn = (
-                voicebox_tts.generate_voiceover
+                functools.partial(
+                    voicebox_tts.generate_voiceover, language=config.get("language")
+                )
                 if voicebox_tts.is_configured()
                 else generate_voiceover
             )

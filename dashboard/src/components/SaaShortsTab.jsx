@@ -313,6 +313,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
         },
         body: JSON.stringify({
           script: scriptToSend,
+          language,
           voice_id: selectedVoice,
           actor_description: actorDescription || undefined,
           selected_actor_url: selectedActor || undefined,
@@ -360,6 +361,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
         },
         body: JSON.stringify({
           script: scriptToSend,
+          language,
           voice_id: selectedVoice,
           actor_description: actorDescription || undefined,
           retry_job_id: jobId,

@@ -5813,6 +5813,10 @@ async def saasshorts_actor_gallery():
 
 class SaaSGenerateRequest(BaseModel):
     script: dict
+    # The language the script was written in. /analyze picks it, but the script
+    # dict does not carry it, so it has to travel with the generate request or
+    # the voiceover has no way to know what it is narrating.
+    language: str = "en"
     voice_id: Optional[str] = None
     actor_description: Optional[str] = None
     selected_actor_url: Optional[str] = None  # Pre-selected actor image URL
@@ -5842,6 +5846,15 @@ async def saasshorts_generate(
     # dashboard now lets through.
     if not elevenlabs_key and not voicebox_tts.is_configured():
         raise HTTPException(status_code=400, detail="Missing ElevenLabs API Key (X-ElevenLabs-Key header)")
+
+    # Same guard as /analyze: an unknown code must not reach the voiceover,
+    # where it would silently fall back to whatever VOICEBOX_LANGUAGE says.
+    if req.language not in SCRIPT_LANGUAGES:
+        known = ", ".join(sorted(SCRIPT_LANGUAGES))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported language '{req.language}'. Supported: {known}",
+        )
 
     # Support retry: reuse output_dir so cached assets (image, voice, head, broll) are kept
     reused = False
@@ -5917,6 +5930,7 @@ async def saasshorts_generate(
         "actor_description": req.actor_description,
         "selected_actor_path": selected_actor_path,
         "video_mode": req.video_mode,
+        "language": req.language,
     }
 
     async def run_generation():
