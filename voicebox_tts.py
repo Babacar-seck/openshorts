@@ -26,6 +26,8 @@ one translates and re-aligns a finished video, which Voicebox does not do.
 """
 
 import os
+import subprocess
+import tempfile
 from typing import Optional
 
 import httpx
@@ -148,21 +150,48 @@ def generate_voiceover(
 
     print(f"[Voicebox] 🎙️ Generating voiceover ({len(text)} chars) on {url}...")
 
-    # /generate/stream synthesises and streams the WAV back in one call — no
-    # polling, and nothing added to the user's Voicebox history for what is an
-    # intermediate render artifact. It chunks long text itself.
-    with httpx.Client(timeout=timeout) as client:
-        with client.stream("POST", f"{url}/generate/stream", json=body) as resp:
-            if resp.status_code != 200:
-                detail = resp.read().decode(errors="replace")[:300]
-                raise Exception(f"Voicebox TTS error ({resp.status_code}): {detail}")
+    # Voicebox always answers WAV, while the caller names the file .mp3
+    # (saasshorts.py builds "<slug>_voice.mp3"). Writing WAV bytes under that
+    # name would upload them to fal's CDN declared as audio/mpeg, and the
+    # lip-sync model would be handed a file that is not what it says it is —
+    # a failure that only surfaces once a real, billed fal key is in play.
+    wants_mp3 = os.path.splitext(output_path)[1].lower() == ".mp3"
+    wav_path = output_path
+    tmp_wav = None
+    if wants_mp3:
+        fd, tmp_wav = tempfile.mkstemp(suffix=".wav", dir=os.path.dirname(output_path) or None)
+        os.close(fd)
+        wav_path = tmp_wav
 
-            with open(output_path, "wb") as f:
-                for chunk in resp.iter_bytes():
-                    f.write(chunk)
+    try:
+        # /generate/stream synthesises and streams the WAV back in one call — no
+        # polling, and nothing added to the user's Voicebox history for what is
+        # an intermediate render artifact. It chunks long text itself.
+        with httpx.Client(timeout=timeout) as client:
+            with client.stream("POST", f"{url}/generate/stream", json=body) as resp:
+                if resp.status_code != 200:
+                    detail = resp.read().decode(errors="replace")[:300]
+                    raise Exception(f"Voicebox TTS error ({resp.status_code}): {detail}")
 
-    if os.path.getsize(output_path) == 0:
-        raise Exception("Voicebox returned an empty audio file")
+                with open(wav_path, "wb") as f:
+                    for chunk in resp.iter_bytes():
+                        f.write(chunk)
+
+        if os.path.getsize(wav_path) == 0:
+            raise Exception("Voicebox returned an empty audio file")
+
+        if wants_mp3:
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-i", wav_path, "-codec:a", "libmp3lame",
+                 "-q:a", "2", output_path],
+                capture_output=True,
+            )
+            if proc.returncode != 0 or not os.path.exists(output_path):
+                detail = proc.stderr.decode(errors="replace")[-300:]
+                raise Exception(f"Voicebox WAV → MP3 conversion failed: {detail}")
+    finally:
+        if tmp_wav and os.path.exists(tmp_wav):
+            os.remove(tmp_wav)
 
     print(f"[Voicebox] ✅ Voiceover: {output_path}")
     return output_path
