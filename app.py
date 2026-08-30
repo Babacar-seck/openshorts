@@ -5369,6 +5369,7 @@ from saasshorts import (
     generate_actor_images,
     get_elevenlabs_voices,
     DEFAULT_VOICES,
+    SCRIPT_LANGUAGES,
 )
 
 # State for SaaSShorts jobs (separate from video processing jobs)
@@ -5396,6 +5397,17 @@ async def saasshorts_analyze(
 
     if not req.url and not req.description:
         raise HTTPException(status_code=400, detail="Provide a URL or a product description")
+
+    # Reject an unknown language here rather than letting generate_scripts pick
+    # a default: the old binary turned every unrecognised code into English, so
+    # a caller asking for a language we do not support got three English scripts
+    # and no way to tell.
+    if req.language not in SCRIPT_LANGUAGES:
+        known = ", ".join(sorted(SCRIPT_LANGUAGES))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported language '{req.language}'. Supported: {known}",
+        )
 
     # Meter the managed Gemini research/analysis (no-op for self-host).
     saas_minutes = _cloud_config.MANAGED_ANALYSIS_MINUTES if BILLING_ENABLED else 0
