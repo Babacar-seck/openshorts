@@ -5825,7 +5825,10 @@ async def saasshorts_generate(
 
     if not fal_key:
         raise HTTPException(status_code=400, detail="Missing fal.ai API Key (X-Fal-Key header)")
-    if not elevenlabs_key:
+    # A self-host backend pointed at a local Voicebox narrates without
+    # ElevenLabs, so requiring the header here would reject the very jobs the
+    # dashboard now lets through.
+    if not elevenlabs_key and not voicebox_tts.is_configured():
         raise HTTPException(status_code=400, detail="Missing ElevenLabs API Key (X-ElevenLabs-Key header)")
 
     # Support retry: reuse output_dir so cached assets (image, voice, head, broll) are kept
