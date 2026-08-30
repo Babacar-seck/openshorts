@@ -705,7 +705,15 @@ function App() {
 
   // Hosted is paid-only (no BYOK core). Self-host uses BYOK keys.
   // `keysMissing` now means "self-host BYOK keys missing" — it never fires on hosted.
-  const keysMissing = !billingEnabled && (!apiKey || !uploadPostKey);
+  //
+  // Gemini alone gates generation: it is the only key the pipeline actually
+  // needs (/api/process rejects on a missing Gemini key and on nothing else).
+  // Upload-Post merely publishes a finished clip, and both publish paths
+  // already guard themselves on `isManaged || (uploadPostKey && uploadUserId)`
+  // (ResultCard.jsx, ScheduleWeekModal.jsx) — so demanding it up front only
+  // stopped people from generating clips they never meant to post.
+  const keysMissing = !billingEnabled && !apiKey;
+  const publishKeyMissing = !billingEnabled && !uploadPostKey;
   const needsPlan = billingEnabled && !isManaged;   // hosted, signed-out or no active plan/trial
 
   // Fresh sign-up: show the welcome plan-choice popup once (AuthContext set the
@@ -1166,14 +1174,8 @@ function App() {
                 title="Configure API keys or choose a plan"
               >
                 <AlertTriangle size={12} />
-                <span className="hidden md:inline">
-                  {!apiKey && !uploadPostKey
-                    ? 'Gemini & Upload-Post keys missing'
-                    : !apiKey
-                      ? 'Gemini API Key Missing'
-                      : 'Upload-Post API Key Missing'}
-                </span>
-                <span className="md:hidden">keys missing</span>
+                <span className="hidden md:inline">Gemini API Key Missing</span>
+                <span className="md:hidden">key missing</span>
               </button>
             )}
           </div>
@@ -1185,13 +1187,10 @@ function App() {
             <div className="flex items-start sm:items-center gap-2.5 sm:gap-3 text-sm text-ink2 min-w-0 flex-1">
               <KeyRound size={16} className="shrink-0 text-warn mt-0.5 sm:mt-0" />
               <div className="min-w-0">
-                <span className="font-medium text-ink">Required API keys missing.</span>{' '}
+                <span className="font-medium text-ink">Gemini API key missing.</span>{' '}
                 <span className="text-muted">
-                  {!apiKey && !uploadPostKey
-                    ? 'Set your Gemini and Upload-Post API keys to use OpenShorts.'
-                    : !apiKey
-                      ? 'Set your Gemini API key to use OpenShorts.'
-                      : 'Set your Upload-Post API key to use OpenShorts.'}
+                  Set your Gemini API key to generate clips.
+                  {publishKeyMissing && ' Upload-Post is optional — add it only when you want to publish.'}
                 </span>
               </div>
             </div>
@@ -1926,11 +1925,7 @@ function App() {
         isOpen={showKeyModal}
         onClose={() => setShowKeyModal(false)}
         eyebrow="SETUP"
-        title={!apiKey && !uploadPostKey
-          ? 'Required API Keys Missing'
-          : !apiKey
-            ? 'Gemini API Key Required'
-            : 'Upload-Post API Key Required'}
+        title="Gemini API Key Required"
         footer={
           <div className="flex gap-3">
             <button
@@ -1950,7 +1945,7 @@ function App() {
       >
         <div className="space-y-4">
           <p className="text-sm text-muted">
-            OpenShorts needs both a <strong className="text-ink2">Gemini</strong> API key and an <strong className="text-ink2">Upload-Post</strong> API key. Both have free tiers.
+            OpenShorts needs a <strong className="text-ink2">Gemini</strong> API key to generate clips — free tier, no card. <strong className="text-ink2">Upload-Post</strong> is optional and only used to publish them.
           </p>
 
           {/* Gemini block */}
@@ -1984,13 +1979,13 @@ function App() {
           {/* Upload-Post block */}
           <div className={`rounded-input p-4 space-y-2 border ${!uploadPostKey ? 'border-rule2' : 'border-rule opacity-70'}`}>
             <p className="text-xs font-medium text-ink flex items-center gap-2">
-              {uploadPostKey ? <Check size={12} className="text-ok" /> : <AlertTriangle size={12} className="text-warn" />}
-              Upload-Post API Key {uploadPostKey && <span className="text-ok">— set</span>}
+              {uploadPostKey ? <Check size={12} className="text-ok" /> : <KeyRound size={12} className="text-muted" />}
+              Upload-Post API Key {uploadPostKey ? <span className="text-ok">— set</span> : <span className="text-muted">— optional</span>}
             </p>
             {!uploadPostKey && (
               <>
                 <p className="text-xs text-muted">
-                  Required to publish your clips to TikTok, Instagram Reels, and YouTube Shorts. Free tier available, no credit card needed.
+                  Only needed to publish your clips to TikTok, Instagram Reels, and YouTube Shorts. Generation works without it. Free tier available, no credit card needed.
                 </p>
                 <ol className="text-xs text-muted space-y-1 list-decimal list-inside">
                   <li>Register at <a href="https://app.upload-post.com/login" target="_blank" rel="noopener noreferrer" className="text-brass underline">app.upload-post.com</a></li>
