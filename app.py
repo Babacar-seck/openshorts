@@ -548,48 +548,183 @@ def _reapply_captions(job_id, clip_index, video_path):
         return None
 
 
+# Sidecar holding what memory knows about a job, so a restart doesn't erase it.
+JOB_SIDECAR = ".job.json"
+
+# Logs are capped before they hit disk. Under DEBUG_LOGS a single job emits
+# thousands of yt-dlp/ffmpeg lines, and the sidecar is rewritten on every
+# heartbeat — the tail is what anyone reads back anyway.
+JOB_SIDECAR_MAX_LOGS = 400
+
+
+def _persist_job(job_id, store=None, kind="clip"):
+    """Write a job's live state beside its output, best effort.
+
+    Everything about a job lived in memory, so a restart lost two things: the
+    logs (recovery replaced them with a one-line placeholder) and, for jobs
+    that never produced a metadata JSON, the job itself — a failed job left
+    nothing on disk to rebuild from, so the whole failure vanished from the
+    history. This sidecar is the missing record. Never raises: a job must not
+    die because its bookkeeping could not be written.
+
+    ``kind`` is stamped into the file rather than inferred from the directory
+    name at read time: the two pipelines are recovered into different dicts,
+    and a rule living only in the reader is one rename away from silently
+    filing AI Shorts jobs as clip jobs.
+    """
+    job = (jobs if store is None else store).get(job_id)
+    if not job:
+        return
+    out_dir = job.get('output_dir')
+    if not out_dir or not os.path.isdir(out_dir):
+        return
+    logs = job.get('logs') or []
+    payload = {
+        "kind": kind,
+        "status": job.get('status'),
+        "logs": logs[-JOB_SIDECAR_MAX_LOGS:],
+        "truncated": max(0, len(logs) - JOB_SIDECAR_MAX_LOGS),
+        "created_at": job.get('created_at'),
+        "user_id": job.get('user_id'),
+        # The source filename, captured while the file is still there: it is
+        # deleted by the retention sweep long before the record ages out, and
+        # a job labelled only by its UUID tells the reader nothing. Only for
+        # clip jobs — the single mp4 in an AI Shorts dir is what the job
+        # produced, so naming the job after it would label it with its output.
+        "label": (_job_label(job) if kind == "clip" else '') or job.get('label') or '',
+        # Clip jobs rebuild their result from the metadata JSON the pipeline
+        # writes, so persisting it here would duplicate a much larger file.
+        # AI Shorts write no such file: without this the recovered job would
+        # know it succeeded but not where its video is.
+        "result": job.get('result') if kind == "shorts" else None,
+    }
+    tmp = os.path.join(out_dir, JOB_SIDECAR + ".tmp")
+    try:
+        # Written through a temp file: the sidecar is rewritten every 10s and a
+        # restart landing mid-write would otherwise leave truncated JSON, which
+        # is exactly the case this whole function exists to survive.
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, os.path.join(out_dir, JOB_SIDECAR))
+    except Exception as e:
+        print(f"⚠️ Could not persist job state for {job_id}: {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _read_job_sidecar(job_path):
+    """The persisted state for a job dir, or None when there is none/unreadable."""
+    try:
+        with open(os.path.join(job_path, JOB_SIDECAR)) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _recovered_status(sidecar, finished):
+    """The status to restore a job with.
+
+    ``finished`` means the disk proves it completed (a metadata JSON), which
+    outranks anything the sidecar says. Otherwise a sidecar last written while
+    the job was still running would resurrect it as 'processing' forever, with
+    no process behind it — the restart is precisely what ended it.
+    """
+    if finished:
+        return 'completed'
+    status = (sidecar or {}).get('status') or 'failed'
+    return 'failed' if status in ('queued', 'processing') else status
+
+
+def _recovered_logs(sidecar):
+    """The persisted log tail, with a marker when lines were dropped."""
+    logs = (sidecar or {}).get('logs') or [
+        "♻️ Job recovered from disk after server restart."
+    ]
+    dropped = (sidecar or {}).get('truncated') or 0
+    if dropped:
+        return [f"… {dropped} earlier line(s) not kept."] + logs
+    return logs
+
+
 def _recover_jobs_from_disk():
-    """Rebuild completed jobs from OUTPUT_DIR after a restart (issue #46 / #18).
+    """Rebuild jobs from OUTPUT_DIR after a restart (issue #46 / #18).
 
     Jobs live in memory, so a restart used to orphan finished clips that are
     still on disk: the frontend restores the job_id from localStorage but every
-    endpoint answers 404 "Job not found". Rebuild a minimal completed record
-    for each job directory that has a metadata JSON.
+    endpoint answers 404 "Job not found". Rebuild a record for each job
+    directory that has a metadata JSON **or** a state sidecar — the sidecar is
+    what carries failed jobs, which produce no metadata and used to disappear
+    from the history entirely on restart.
     """
     recovered = 0
     try:
         entries = os.listdir(OUTPUT_DIR)
     except FileNotFoundError:
         return
-    for job_id in entries:
-        job_path = os.path.join(OUTPUT_DIR, job_id)
-        if not os.path.isdir(job_path) or job_id in jobs:
+    for entry in entries:
+        job_path = os.path.join(OUTPUT_DIR, entry)
+        if not os.path.isdir(job_path):
+            continue
+
+        # AI Shorts live in the same OUTPUT_DIR under a "saas_" prefix and are
+        # recovered into their own dict — /api/saasshorts/status reads that one,
+        # and filing them under `jobs` would make them 404 there while showing
+        # up in the clip generator as jobs with no clips.
+        sidecar = _read_job_sidecar(job_path)
+        if entry.startswith("saas_") or (sidecar or {}).get("kind") == "shorts":
+            job_id = entry[len("saas_"):] if entry.startswith("saas_") else entry
+            if job_id in saas_jobs or not sidecar:
+                continue
+            saas_jobs[job_id] = {
+                "status": _recovered_status(sidecar, finished=False),
+                "logs": _recovered_logs(sidecar),
+                "output_dir": job_path,
+                "user_id": sidecar.get("user_id"),
+                "created_at": sidecar.get("created_at"),
+                "label": sidecar.get("label") or '',
+                "result": sidecar.get("result"),
+            }
+            recovered += 1
+            continue
+
+        job_id = entry
+        if job_id in jobs:
             continue
         json_files = glob.glob(os.path.join(job_path, "*_metadata.json"))
-        if not json_files:
+        if not json_files and not sidecar:
             continue
         try:
-            with open(json_files[0], 'r') as f:
-                data = json.load(f)
-            base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
-            clips = data.get('shorts', [])
-            for i, clip in enumerate(clips):
-                if not clip.get('video_url'):
-                    clip['video_url'] = (
-                        f"/videos/{job_id}/"
-                        f"{_canonical_clip_file(job_path, base_name, i)}")
+            clips = []
+            cost = None
+            if json_files:
+                with open(json_files[0], 'r') as f:
+                    data = json.load(f)
+                base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
+                clips = data.get('shorts', [])
+                cost = data.get('cost_analysis')
+                for i, clip in enumerate(clips):
+                    if not clip.get('video_url'):
+                        clip['video_url'] = (
+                            f"/videos/{job_id}/"
+                            f"{_canonical_clip_file(job_path, base_name, i)}")
             owner = None
             owner_path = os.path.join(job_path, ".owner")
             if os.path.exists(owner_path):
                 with open(owner_path) as f:
                     raw = f.read().strip()
                 owner = int(raw) if raw.isdigit() else (raw or None)
+
             jobs[job_id] = {
-                'status': 'completed',
-                'logs': ["♻️ Job recovered from disk after server restart."],
+                'status': _recovered_status(sidecar, finished=bool(json_files)),
+                'logs': _recovered_logs(sidecar),
                 'output_dir': job_path,
-                'user_id': owner,
-                'result': {'clips': clips, 'cost_analysis': data.get('cost_analysis')},
+                'user_id': owner if owner is not None else (sidecar or {}).get('user_id'),
+                'created_at': (sidecar or {}).get('created_at'),
+                'label': (sidecar or {}).get('label') or '',
+                'result': ({'clips': clips, 'cost_analysis': cost} if clips else None),
             }
             recovered += 1
         except Exception as e:
@@ -1743,6 +1878,7 @@ async def run_job(job_id, job_data):
     
     jobs[job_id]['status'] = 'processing'
     jobs[job_id]['logs'].append("Job started by worker.")
+    _persist_job(job_id)
     print(f"🎬 [run_job] Executing command for {job_id}: {' '.join(cmd)}")
     
     try:
@@ -1766,6 +1902,10 @@ async def run_job(job_id, job_data):
             await asyncio.sleep(2)
             if time.time() - last_heartbeat >= HEARTBEAT_EVERY:
                 _touch_manifest(job_id)
+                # Same tick as the manifest heartbeat: the logs a running job
+                # has produced so far survive a kill that never reaches the
+                # terminal-state write below (OOM, docker kill, power loss).
+                _persist_job(job_id)
                 last_heartbeat = time.time()
             
             # Check for partial results every 2 seconds
@@ -1854,6 +1994,12 @@ async def run_job(job_id, job_data):
         # Exception text can embed URLs with credentials (e.g. the proxy URL
         # inside a yt-dlp/httpx error) — scrub before it reaches client logs.
         jobs[job_id]['logs'].append(_scrub_secrets(f"Execution error: {str(e)}"))
+    finally:
+        # One write for every way out — success, failure, exception. Put on a
+        # branch instead, it would be forgotten the next time a branch is added,
+        # and that job's final state would silently stop surviving restarts.
+        _persist_job(job_id)
+
 
 @app.get("/health")
 async def health():
@@ -2402,6 +2548,7 @@ async def process_endpoint(
     jobs[job_id] = {
         'status': 'queued',
         'logs': [f"Job {job_id} queued."],
+        'created_at': time.time(),
         'cmd': cmd,
         'env': env,
         'output_dir': job_output_dir,
@@ -2486,6 +2633,113 @@ async def get_status(job_id: str, request: Request):
         "logs": _visible_logs(job['logs']),
         "result": job.get('result')
     }
+
+
+# How many jobs /api/jobs returns. The list is a monitor, not an archive —
+# HistoryTab already serves the durable library — so it stays short enough to
+# render without pagination.
+JOBS_LIST_LIMIT = 50
+
+
+def _job_label(job: dict) -> str:
+    """A human name for a job: its source file, or '' if we can't tell.
+
+    The job id is a UUID and the output dir is named after it, so neither says
+    anything to the person reading the list. The source video sitting in the
+    job dir does — it is the YouTube title for URL jobs (yt-dlp names the file
+    after it) and the original filename for uploads.
+    """
+    out_dir = job.get('output_dir')
+    if not out_dir:
+        return ''
+    try:
+        for path in sorted(glob.glob(os.path.join(glob.escape(out_dir), "*.mp4"))):
+            name = os.path.basename(path)
+            # Skip the products of the job — we want what went in, not out.
+            if "_clip_" in name or name.startswith("temp_"):
+                continue
+            return os.path.splitext(name)[0]
+    except Exception:
+        pass
+    return ''
+
+
+def _job_started_at(job: dict) -> float:
+    """When the job started, as an epoch. 0 when nothing on disk says.
+
+    Jobs created before this field existed — and those rebuilt from disk after
+    a restart — carry no 'created_at', so fall back to the output dir's mtime.
+    That is the last write rather than the creation, which is close enough to
+    order the list and never invents a time for a job that has no directory.
+    """
+    stamped = job.get('created_at')
+    if stamped:
+        return float(stamped)
+    out_dir = job.get('output_dir')
+    try:
+        return os.path.getmtime(out_dir) if out_dir else 0.0
+    except OSError:
+        return 0.0
+
+
+async def _owns_job(request, record) -> bool:
+    """Predicate form of _assert_job_owner, for filtering a list.
+
+    Same rule, no exception: self-host (BILLING off) and ownerless BYOK jobs
+    are everyone's; a stamped owner must match the caller. Listing must never
+    be more permissive than fetching one by id, or the tab becomes a way to
+    enumerate other tenants' work.
+    """
+    if not BILLING_ENABLED:
+        return True
+    owner = record.get("user_id") if isinstance(record, dict) else None
+    if owner is None:
+        return True
+    user = await _user_from_request(request)
+    return bool(user) and str(owner) == str(user.id)
+
+
+@app.get("/api/jobs")
+async def list_jobs(request: Request):
+    """Every job this caller can see, newest first — the two pipelines merged.
+
+    Without this the dashboard could only follow a job whose id it had itself
+    just received, so anything submitted through the API, the MCP server or an
+    agent was invisible: the UI kept showing the last job it happened to know
+    about, including its stale error, while a different job ran to completion
+    on the server. Clip jobs and AI Shorts jobs live in separate dicts and are
+    reported here under a 'kind' rather than through two calls, because the
+    question the tab answers — what is running right now — spans both.
+    """
+    rows = []
+    for kind, store in (("clip", jobs), ("shorts", saas_jobs)):
+        # Snapshot the ids first: a job finishing mid-iteration mutates the
+        # dict, and a RuntimeError here would blank the whole tab.
+        for job_id in list(store.keys()):
+            job = store.get(job_id)
+            if not isinstance(job, dict):
+                continue
+            if not await _owns_job(request, job):
+                continue
+            logs = _visible_logs(job.get('logs') or [])
+            result = job.get('result') or {}
+            rows.append({
+                "job_id": job_id,
+                "kind": kind,
+                "status": (_presented_status(job_id, job) if kind == "clip"
+                           else job.get('status')),
+                # The last visible log line is what the pipeline is doing now;
+                # it is already scrubbed and cloud-filtered by _visible_logs.
+                "stage": (logs[-1][:160] if logs else ''),
+                # Live: read the source file still in the job dir. Recovered:
+                # fall back to the name the sidecar captured before the
+                # retention sweep deleted that file.
+                "label": _job_label(job) or job.get('label') or '',
+                "started_at": _job_started_at(job),
+                "clips": len(result.get('clips') or []),
+            })
+    rows.sort(key=lambda r: r["started_at"], reverse=True)
+    return {"jobs": rows[:JOBS_LIST_LIMIT]}
 
 
 def _locate_source(job_id: str):
@@ -5881,6 +6135,7 @@ async def saasshorts_generate(
             saas_jobs[job_id] = {
                 "user_id": await _owner_id(request),
                 "status": "processing",
+                "created_at": time.time(),
                 "logs": [f"Retrying job {job_id[:8]}... reusing cached assets from disk."],
                 "result": None,
                 "output_dir": job_output_dir,
@@ -5893,10 +6148,14 @@ async def saasshorts_generate(
         saas_jobs[job_id] = {
             "user_id": await _owner_id(request),
             "status": "processing",
+            "created_at": time.time(),
             "logs": ["SaaSShorts job started."],
             "result": None,
             "output_dir": job_output_dir,
         }
+        # Checkpoint before any work starts: a job killed before its first log
+        # tick would otherwise leave a directory nothing can be rebuilt from.
+        _persist_job(job_id, saas_jobs, "shorts")
 
     # If user selected a pre-generated actor, resolve it to a local path
     selected_actor_path = None
@@ -5938,10 +6197,21 @@ async def saasshorts_generate(
         try:
             loop = asyncio.get_running_loop()
 
+            # Throttled like the clip pipeline's manifest heartbeat. This runs
+            # per log line inside a long executor call with no polling loop of
+            # its own, so it is the only place that can checkpoint an AI Shorts
+            # job while it is still running — and a job killed mid-render
+            # (OOM, redeploy) keeps the logs up to the last tick.
+            last_persist = [0.0]
+
             def log_msg(msg):
                 print(f"[SaaSShorts Job {job_id[:8]}] {msg}")
                 if job_id in saas_jobs:
                     saas_jobs[job_id]["logs"].append(msg)
+                    now = time.time()
+                    if now - last_persist[0] >= HEARTBEAT_EVERY:
+                        last_persist[0] = now
+                        _persist_job(job_id, saas_jobs, "shorts")
 
             def run():
                 return generate_full_video(req.script, config, job_output_dir, log_msg)
@@ -5998,6 +6268,9 @@ async def saasshorts_generate(
                 saas_jobs[job_id]["status"] = "failed"
                 saas_jobs[job_id]["logs"].append(f"Error: {str(e)}")
         finally:
+            # One write for every way out — success, failure, exception — so a
+            # branch added later cannot quietly stop surviving restarts.
+            _persist_job(job_id, saas_jobs, "shorts")
             concurrency_semaphore.release()
 
     asyncio.create_task(run_generation())

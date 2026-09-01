@@ -21,6 +21,7 @@ import LoginModal from './components/LoginModal';
 import TrialGate from './components/TrialGate';
 import AdvancedBanner from './components/AdvancedBanner';
 import HistoryTab from './components/HistoryTab';
+import JobsTab from './components/JobsTab';
 import ProfileMenu from './components/ProfileMenu';
 import Modal from './components/ui/Modal';
 import { useAuth } from './contexts/AuthContext';
@@ -436,6 +437,26 @@ function App() {
     setProcessingMedia(null);
     setQualityGate(null);
     setStatus('complete');
+    setActiveTab('dashboard');
+  };
+
+  // Adopt a job the Jobs tab listed as the one the Clip Generator is showing.
+  //
+  // Unlike restoreProject this needs no /restore call: the job is still the
+  // server's own, with its clips on local disk, so pointing the existing status
+  // poll at its id is enough. That also means a job someone else started — via
+  // the API, an agent or the MCP server — becomes editable here.
+  const openJob = async (targetJobId) => {
+    const data = await pollJob(targetJobId);
+    flushClipState();
+    setProjectState(null);
+    setNoSource(false);
+    setJobId(targetJobId);
+    setResults(data.result || null);
+    setLogs(data.logs || []);
+    setProcessingMedia(null);
+    setQualityGate(null);
+    setStatus(data.status === 'completed' ? 'complete' : data.status);
     setActiveTab('dashboard');
   };
 
@@ -904,8 +925,12 @@ function App() {
     { id: 'ai-agent', ord: '03', icon: Bot, label: 'AI Agent', short: 'agent', byok: true },
     { id: 'ugc-gallery', ord: '04', icon: LayoutGrid, label: 'UGC Gallery', short: 'gallery', primary: true },
     { id: 'thumbnails', ord: '05', icon: Image, label: 'YouTube Studio', short: 'studio', primary: true },
-    ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '06', icon: History, label: 'History', short: 'history' }] : []),
-    { id: 'settings', ord: '07', icon: Settings, label: 'Settings', short: 'settings' },
+    // Unconditional, unlike History: this one reads the server's live job
+    // state, which exists in self-host too — and self-host is exactly where
+    // jobs arrive from the API and the MCP server with no browser to show them.
+    { id: 'jobs', ord: '06', icon: Activity, label: 'Jobs', short: 'jobs' },
+    ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '07', icon: History, label: 'History', short: 'history' }] : []),
+    { id: 'settings', ord: '08', icon: Settings, label: 'Settings', short: 'settings' },
   ];
   const activeNav = navItems.find((n) => n.id === activeTab);
 
@@ -1591,6 +1616,13 @@ function App() {
               <div className="max-w-6xl mx-auto p-4 sm:p-6 md:p-8">
                 <UGCGallery />
               </div>
+            </div>
+          )}
+
+          {/* View: Jobs — everything the server is running, whoever started it */}
+          {activeTab === 'jobs' && (
+            <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
+              <JobsTab onOpenJob={openJob} />
             </div>
           )}
 
