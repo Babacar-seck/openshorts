@@ -395,6 +395,18 @@ Stripe retry the same doomed event for three days.
 ### Concurrency Model
 Async job queue with semaphore-based concurrency control. Configure via `MAX_CONCURRENT_JOBS` env var (default: 5). Jobs auto-cleanup after 1 hour.
 
+The real limit on the GPU box is VRAM, not CPU: each `main.py` job holds
+Parakeet (onnxruntime CUDA), TransNetV2 (torch, ~2 GB at peak) and an
+NVENC session, and when the card is full a cut fails as "Generic error in
+an external library" / exit 187 with 0 bytes, TransNetV2 as CUDA OOM, and
+the reframe writer as a broken pipe. The retry in `ffmpeg_utils.cut_clip`
+waits for a **busy** GPU; it cannot help with a **full** one. The API
+process itself was the biggest tenant (7.7 GB idle on 17-sep-2026): the
+thumbnail studio and `/api/subtitle` on a dubbed clip transcribe
+in-process and the ASR singletons then lived in uvicorn for good, so both
+now call `transcribe_backends.release_models()` when they are done. Size
+`MAX_CONCURRENT_JOBS` against the free VRAM, not the core count.
+
 ### Paid proxy accounting (`cloud/proxy_ledger.py`)
 
 Downloads go direct → static ISP proxies (flat rate) → DataImpulse (per GB),
@@ -443,7 +455,21 @@ paid ones, each free attempt's error); `app.py` persists it as a
 `proxy_usage` row at job end and pages Telegram when the paid proxy carried
 bytes, folding a burst into one message per 5 min. The in-memory monthly
 counter and the container log (rotates within the hour) cannot answer "what
-cost $14 on the 28th"; the table can. `PAID_PROXY_DAILY_MB` (default
+cost $14 on the 28th"; the table can. Both the probe and the download pass `noplaylist`: a
+`watch?v=X&list=...` or mix link is the one video the user was watching,
+and without it yt-dlp walks the whole list, dies on its first private /
+age-gated / bot-checked entry (a video nobody pasted), the probe reads
+that as an IP problem and pays the proxy to walk the same list again, and
+the user gets a 400 for a valid link (26 of the 37 paid probes between
+7 and 17-sep-2026). And the probe keeps **every** attempt's error per
+static route, not the last one: the anonymous retry ends in a bot-check
+by design, and a "confirm your age" from the cookie attempt is the
+verdict, so it must not be overwritten into an escalation. A search,
+playlist or channel URL is refused by path before any request
+(`yt_clients.youtube_non_video_reason`): `noplaylist` does nothing for
+those and yt-dlp walks them entry by entry (one search URL held the
+probe thread for 37 min in the prod container).
+`PAID_PROXY_DAILY_MB` (default
 500) is the hard ceiling: past it the paid proxy is dropped from the probe
 and from every new job's env until UTC midnight. The watcher probes the
 static pool against a real YouTube watch page (playable markers), not

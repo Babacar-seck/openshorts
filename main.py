@@ -793,6 +793,11 @@ def download_youtube_video(url, output_dir="."):
     # signed links; refresh through the host's page so yt-dlp gets the file.
     import file_hosts
     url = file_hosts.resolve(url)
+    # Cloud mode rejects these at the probe; this is the self-host path.
+    from yt_clients import NotASingleVideo, youtube_non_video_reason
+    reason = youtube_non_video_reason(url)
+    if reason:
+        raise NotASingleVideo(f"This link is {reason}.")
 
     print(f"🔍 Debug: yt-dlp version: {yt_dlp.version.__version__}")
     print("📥 Downloading video from YouTube...")
@@ -872,6 +877,11 @@ def download_youtube_video(url, output_dir="."):
             'cookiefile': cookies_path if (cookies and cookies_path) else None,
             'proxy': proxy, 'socket_timeout': 30, 'retries': 10, 'fragment_retries': 10,
             'nocheckcertificate': True, 'cachedir': False,
+            # A `watch?v=X&list=...` link is the one video the user was
+            # watching, not the playlist: without this yt-dlp downloads every
+            # entry of the list into the SAME outtmpl (the title is the
+            # playlist's), paying for all of them and keeping the last.
+            'noplaylist': True,
             'extractor_args': extractor_args,
             'http_headers': {
                 'User-Agent': (

@@ -355,7 +355,12 @@ async def reserve_process_minutes(request, url, input_path, job_id, max_minutes=
                                         allow_paid=paid_allowed))
         else:
             minutes = await loop.run_in_executor(None, _metering.probe_file_minutes, input_path)
-    except Exception:
+    except Exception as e:
+        from yt_clients import NotASingleVideo
+        if isinstance(e, NotASingleVideo):
+            raise HTTPException(status_code=400, detail=(
+                f"{e} Paste the link of one video (youtube.com/watch?v=... "
+                "or youtu.be/...)."))
         raise HTTPException(status_code=400,
                             detail="Could not determine the video duration. Try a different source.")
     finally:
@@ -4287,7 +4292,13 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
                 return generate_srt_from_video(input_path, srt_path)
 
             loop = asyncio.get_event_loop()
-            success = await loop.run_in_executor(None, run_transcribe_srt)
+            try:
+                success = await loop.run_in_executor(None, run_transcribe_srt)
+            finally:
+                # The ASR models must not stay resident in the API process:
+                # they held 7.7 GB of VRAM idle (transcribe_backends.release_models).
+                import transcribe_backends
+                await loop.run_in_executor(None, transcribe_backends.release_models)
         elif is_karaoke:
             success = generate_ass(sub_transcript, sub_start, sub_end, srt_path, **karaoke_opts)
         else:
@@ -5107,7 +5118,13 @@ async def thumbnail_upload(
 
             from main import transcribe_video
             loop = asyncio.get_event_loop()
-            transcript = await loop.run_in_executor(None, transcribe_video, vpath)
+            try:
+                transcript = await loop.run_in_executor(None, transcribe_video, vpath)
+            finally:
+                # See transcribe_backends.release_models: the API process is
+                # long-lived and the GPU is shared with every running job.
+                import transcribe_backends
+                await loop.run_in_executor(None, transcribe_backends.release_models)
             segments = transcript.get("segments", [])
             duration = segments[-1]["end"] if segments else 0
 
